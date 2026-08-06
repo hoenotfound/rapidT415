@@ -122,8 +122,9 @@ def get_route_metadata(route_param):
         try:
             stops = json.loads(bstp_match.group(1))
             print(f"[debug] extracted {len(stops)} bus stop(s) from page", file=sys.stderr)
-            if stops:
-                print(f"[debug]   sample stop record: {stops[0]}", file=sys.stderr)
+            for s in stops:
+                print(f"[debug]   stop: id={s.get('stop_id')!r} "
+                      f"name={s.get('stop_name')!r}", file=sys.stderr)
         except Exception as e:
             print(f"[warn] found 'bstp' but couldn't parse it as JSON ({e}); "
                   "geofence check will be skipped.", file=sys.stderr)
@@ -243,6 +244,9 @@ def check_stop_departure(on_route_buses, stops, args, stop_watch_state, ts, kios
               f"Known stop_ids: {[s.get('stop_id') for s in stops]}", file=sys.stderr)
         return stop_watch_state
 
+    print(f"[debug] watched stop resolved: id={target.get('stop_id')!r} "
+          f"name={target.get('stop_name')!r}", file=sys.stderr)
+
     coords = stop_lat_lon(target)
     if coords is None:
         print(f"[warn] watched stop found but has no usable coordinates: {target}",
@@ -288,6 +292,9 @@ def check_stop_departure(on_route_buses, stops, args, stop_watch_state, ts, kios
         w_state["alerted"] = True
 
     return stop_watch_state
+
+
+def try_parse_payload(data):
     """Try a few plausible encodings for the live-bus payload, since we
     can't verify live which one the server actually uses."""
     if isinstance(data, list):
