@@ -1,0 +1,42 @@
+# Save this file as .github/workflows/bus-check.yml in a (can be private) GitHub repo
+# that also contains bus_monitor.py at the repo root.
+#
+# SETUP (one-time):
+# 1. Create a Telegram bot: message @BotFather on Telegram -> /newbot -> copy the token.
+# 2. Get your chat ID: message your new bot anything, then visit
+#    https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates and look for "chat":{"id": ...}
+# 3. In your GitHub repo: Settings -> Secrets and variables -> Actions -> New repository secret
+#      TELEGRAM_TOKEN   = the bot token
+#      TELEGRAM_CHAT_ID = your chat id
+# 4. Adjust the cron schedule below to your commute times (times are in UTC!
+#    Malaysia is UTC+8, so 7:30am MYT = 23:30 UTC the previous day).
+#
+# This runs every 10 minutes within two commute windows on weekdays only.
+
+name: Bus Route Monitor
+
+on:
+  schedule:
+    # Weekday mornings, MYT ~7:00-9:00 (UTC 23:00-01:00, so split across two lines)
+    - cron: "*/10 23 * * 0-4"   # Mon-Fri MYT mornings (Sun-Thu UTC due to date rollover)
+    - cron: "*/10 0-1 * * 1-5"  # continuation into MYT ~08:00-09:00
+    # Weekday evenings, MYT ~17:00-19:00 (UTC 09:00-11:00)
+    - cron: "*/10 9-11 * * 1-5"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  check-bus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 socketIO-client-2
+      - name: Run bus check
+        run: |
+          python bus_monitor.py \
+            --route 765 \
+            --telegram-token "${{ secrets.TELEGRAM_TOKEN }}" \
+            --telegram-chat-id "${{ secrets.TELEGRAM_CHAT_ID }}"
