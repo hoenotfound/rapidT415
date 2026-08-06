@@ -49,6 +49,7 @@ python bus_monitor.py --route 765 --telegram-token XXX --telegram-chat-id YYY
 
 import argparse
 import base64
+import gzip
 import json
 import re
 import sys
@@ -113,7 +114,13 @@ def try_parse_payload(data):
         return None
     if not isinstance(data, str) or not data:
         return None
-    # base64 + zlib (original assumption)
+    # gzip (confirmed format: base64 payloads start with "H4sI", the
+    # base64 signature for gzip's magic bytes 1f 8b 08)
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(data)))
+    except Exception:
+        pass
+    # zlib (kept as a fallback in case a different route ever uses this)
     try:
         return json.loads(zlib.decompress(base64.b64decode(data)))
     except Exception:
