@@ -101,6 +101,36 @@ def get_route_metadata(route_param):
     return no_route, provider
 
 
+def try_parse_payload(data):
+    """Try a few plausible encodings for the live-bus payload, since we
+    can't verify live which one the server actually uses."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "buses", "list", "result"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+        return None
+    if not isinstance(data, str) or not data:
+        return None
+    # base64 + zlib (original assumption)
+    try:
+        return json.loads(zlib.decompress(base64.b64decode(data)))
+    except Exception:
+        pass
+    # plain JSON string
+    try:
+        return json.loads(data)
+    except Exception:
+        pass
+    # base64 -> plain JSON (no compression)
+    try:
+        return json.loads(base64.b64decode(data))
+    except Exception:
+        pass
+    return None
+
+
 def count_active_buses(no_route, provider, timeout=15):
     """Connect to the socket, request live data, count matching buses."""
     result = {"count": None, "raw": None}
@@ -114,26 +144,33 @@ def count_active_buses(no_route, provider, timeout=15):
                 "route": no_route,
             })
 
-        def on_fts_client(self, data):
-            try:
-                decompressed = zlib.decompress(base64.b64decode(data))
-                buses = json.loads(decompressed)
-            except Exception:
-                # data might already be plain JSON/text depending on server config
-                try:
-                    buses = json.loads(data)
-                except Exception as e:
-                    print(f"[error] could not decode payload: {e}", file=sys.stderr)
-                    buses = []
-
-            matching = [b for b in buses if str(b.get("route", "")) == str(no_route)]
-            result["count"] = len(matching)
-            result["raw"] = buses
-
     socket = SocketIO(f"https://{SOCKET_HOST}", 443,
                        Namespace=FtsNamespace,
                        transports=["websocket"])
-    socket.on("onFts-client", lambda data: FtsNamespace.on_fts_client(socket.get_namespace(), data))
+
+    def handle_data(*args):
+        print(f"[debug] onFts-client fired with {len(args)} arg(s)", file=sys.stderr)
+        for i, a in enumerate(args):
+            preview = repr(a)[:200]
+            print(f"[debug]   arg[{i}] type={type(a).__name__} preview={preview}",
+                  file=sys.stderr)
+
+        buses = None
+        for a in args:
+            buses = try_parse_payload(a)
+            if buses is not None:
+                break
+
+        if buses is None:
+            print("[error] could not decode payload from any argument received "
+                  "-- see [debug] lines above for the raw shape", file=sys.stderr)
+            buses = []
+
+        matching = [b for b in buses if str(b.get("route", "")) == str(no_route)]
+        result["count"] = len(matching)
+        result["raw"] = buses
+
+    socket.on("onFts-client", handle_data)
 
     start = time.time()
     while result["count"] is None and (time.time() - start) < timeout:
