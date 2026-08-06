@@ -4,7 +4,14 @@ bus_monitor.py
 
 Checks how many buses are currently active on a RapidBus (Prasarana) route,
 by talking to the same feed the kiosk map page uses, and sends a Telegram
-alert if the count drops to 1 or 0.
+alert if the count of buses actually ON the route drops to 1 or 0.
+
+"Actually on the route" matters because the feed sometimes reports a bus
+under this route's code even though its GPS position is nowhere near the
+route -- e.g. parked at a depot. Those are filtered out by checking each
+bus's position against the route's own bus stops (also embedded in the
+kiosk page) and requiring it to be within --max-distance-km of at least
+one stop.
 
 HOW IT WORKS
 ------------
@@ -17,9 +24,9 @@ HOW IT WORKS
    and emit "onFts-reload" with {sid, uid, provider, route}.
 3. Listen for "onFts-client" -> payload is base64 + zlib-compressed JSON,
    a list of bus position records, each with a "route" field.
-4. Count how many records match our route. That's the same number the
-   map shows as bus icons.
-5. If count <= 1, send a Telegram message.
+4. Count how many records match our route, then further filter to only
+   those within --max-distance-km of one of the route's own bus stops.
+5. If that filtered count <= 1, send a Telegram message.
 
 IMPORTANT - THINGS YOU MAY NEED TO ADJUST
 ------------------------------------------
@@ -71,7 +78,9 @@ def random_sid(length=32):
 
 
 def get_route_metadata(route_param):
-    """Fetch the kiosk page and pull out the internal route code + provider."""
+    """Fetch the kiosk page and pull out the internal route code, provider,
+    and the list of the route's bus stops (used later for the geofence
+    check)."""
     url = f"{KIOSK_BASE}?route={route_param}&bus="
     headers = {
         "User-Agent": (
@@ -87,6 +96,7 @@ def get_route_metadata(route_param):
     # --- adjust here if extraction fails ---
     no_route_match = re.search(r"var no_route\s*=.*?\?\s*'([^']+)'\s*:", html, re.S)
     prm_match = re.search(r"var prm\s*=\s*'([^']*)'", html)
+    bstp_match = re.search(r"var bstp\s*=\s*(\[.*?\])\s*;", html, re.S)
 
     no_route = no_route_match.group(1) if no_route_match else route_param
     provider = prm_match.group(1) if prm_match else ""
@@ -99,7 +109,68 @@ def get_route_metadata(route_param):
         print("[warn] could not auto-extract provider ('prm') from page; "
               "using empty string.", file=sys.stderr)
 
-    return no_route, provider
+    stops = []
+    if bstp_match:
+        try:
+            stops = json.loads(bstp_match.group(1))
+            print(f"[debug] extracted {len(stops)} bus stop(s) from page", file=sys.stderr)
+            if stops:
+                print(f"[debug]   sample stop record: {stops[0]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[warn] found 'bstp' but couldn't parse it as JSON ({e}); "
+                  "geofence check will be skipped.", file=sys.stderr)
+    else:
+        print("[warn] could not find 'bstp' (bus stop list) on the page; "
+              "geofence check will be skipped, falling back to plain "
+              "route-code matching.", file=sys.stderr)
+
+    return no_route, provider, stops
+
+
+def stop_lat_lon(stop):
+    """Bus stop records may use different key names for coordinates --
+    try the common ones."""
+    lat_keys = ("latitude", "lat", "Lat", "y")
+    lon_keys = ("longitude", "lon", "lng", "Lon", "Lng", "x")
+    lat = next((stop[k] for k in lat_keys if k in stop and stop[k] not in (None, "")), None)
+    lon = next((stop[k] for k in lon_keys if k in stop and stop[k] not in (None, "")), None)
+    try:
+        return float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, asin, sqrt
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 2 * 6371 * asin(sqrt(a))
+
+
+def filter_on_route(buses, stops, max_distance_km):
+    """Keep only buses whose GPS position is near at least one of the
+    route's bus stops. If we don't have usable stop coordinates, skip the
+    check entirely (return buses unchanged) rather than falsely zeroing
+    everything out."""
+    stop_coords = [c for c in (stop_lat_lon(s) for s in stops) if c is not None]
+    if not stop_coords:
+        print("[warn] no usable stop coordinates, skipping geofence check",
+              file=sys.stderr)
+        return buses
+
+    on_route = []
+    for b in buses:
+        try:
+            blat, blon = float(b.get("latitude")), float(b.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        nearest = min(haversine_km(blat, blon, slat, slon) for slat, slon in stop_coords)
+        print(f"[debug]   bus {b.get('bus_no', '?')}: {nearest:.2f} km from "
+              f"nearest stop", file=sys.stderr)
+        if nearest <= max_distance_km:
+            on_route.append(b)
+    return on_route
 
 
 def try_parse_payload(data):
@@ -228,17 +299,21 @@ def main():
     parser.add_argument("--state-file", default="status.json",
                          help="Where to persist last known state, so alerts "
                               "only fire on a CHANGE, not every check.")
+    parser.add_argument("--max-distance-km", type=float, default=2.0,
+                         help="A bus further than this from every stop on "
+                              "the route is treated as not actually "
+                              "running it (default 2.0 km).")
     args = parser.parse_args()
 
     previous = load_state(args.state_file)
     prev_state = previous.get("state", "unknown")
 
-    no_route, provider = get_route_metadata(args.route)
+    no_route, provider, stops = get_route_metadata(args.route)
     print(f"[info] route param={args.route} -> no_route={no_route} provider={provider!r}")
 
-    count, raw = count_active_buses(no_route, provider)
+    raw_matching_count, raw_matching = count_active_buses(no_route, provider)
 
-    if count is None:
+    if raw_matching_count is None:
         print("[error] no data received from feed within timeout", file=sys.stderr)
         if prev_state != "error":
             send_telegram(
@@ -249,7 +324,13 @@ def main():
         save_state(args.state_file, "error", None)
         sys.exit(1)
 
-    print(f"[info] active buses on route {args.route}: {count}")
+    print(f"[info] buses reporting route {args.route}: {raw_matching_count}")
+
+    on_route = filter_on_route(raw_matching, stops, args.max_distance_km)
+    count = len(on_route)
+    print(f"[info] of those, actually on the route (within "
+          f"{args.max_distance_km}km of a stop): {count}")
+
     new_state = "low" if count <= args.alert_threshold else "normal"
 
     if new_state != prev_state:
