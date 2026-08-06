@@ -269,10 +269,36 @@ def count_active_buses(no_route, provider, timeout=15):
     return result["count"], result["raw"]
 
 
+def count_active_buses_with_retries(no_route, provider, attempts=3, timeout=15, delay=5):
+    """Call count_active_buses up to `attempts` times, only giving up
+    (returning None) if every attempt fails to get data. A transient
+    network hiccup shouldn't trigger a false 'feed is down' alert."""
+    for attempt in range(1, attempts + 1):
+        count, raw = count_active_buses(no_route, provider, timeout=timeout)
+        if count is not None:
+            if attempt > 1:
+                print(f"[info] got data on attempt {attempt}/{attempts}", file=sys.stderr)
+            return count, raw
+        print(f"[warn] attempt {attempt}/{attempts} got no data from feed",
+              file=sys.stderr)
+        if attempt < attempts:
+            time.sleep(delay)
+    return None, None
+
+
 def send_telegram(token, chat_id, message):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
     resp.raise_for_status()
+
+
+def myt_timestamp():
+    """Human-readable current time in Malaysia time, e.g. '6:42am MYT'."""
+    from datetime import datetime, timezone, timedelta
+    myt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc).astimezone(myt)
+    hour12 = now.strftime("%I").lstrip("0") or "12"
+    return f"{hour12}:{now.strftime('%M%p').lower()} MYT"
 
 
 def load_state(path):
@@ -281,12 +307,17 @@ def load_state(path):
         with open(path, "r") as f:
             return json.load(f)
     except Exception:
-        return {"state": "unknown", "count": None}
+        return {"state": "unknown", "count": None, "last_alert_at": 0}
 
 
-def save_state(path, state, count):
+def save_state(path, state, count, last_alert_at):
     with open(path, "w") as f:
-        json.dump({"state": state, "count": count, "checked_at": time.time()}, f)
+        json.dump({
+            "state": state,
+            "count": count,
+            "checked_at": time.time(),
+            "last_alert_at": last_alert_at,
+        }, f)
 
 
 def main():
@@ -303,27 +334,44 @@ def main():
                          help="A bus further than this from every stop on "
                               "the route is treated as not actually "
                               "running it (default 2.0 km).")
+    parser.add_argument("--feed-retries", type=int, default=3,
+                         help="How many times to retry the feed connection "
+                              "before treating it as actually down (default 3).")
+    parser.add_argument("--retry-delay", type=float, default=5.0,
+                         help="Seconds to wait between feed retry attempts (default 5).")
+    parser.add_argument("--reminder-minutes", type=float, default=25.0,
+                         help="While still in a 'low' state, re-send a "
+                              "reminder at most this often, in minutes "
+                              "(default 25).")
     args = parser.parse_args()
 
     previous = load_state(args.state_file)
     prev_state = previous.get("state", "unknown")
+    last_alert_at = previous.get("last_alert_at", 0)
 
     no_route, provider, stops = get_route_metadata(args.route)
     print(f"[info] route param={args.route} -> no_route={no_route} provider={provider!r}")
 
-    raw_matching_count, raw_matching = count_active_buses(no_route, provider)
+    raw_matching_count, raw_matching = count_active_buses_with_retries(
+        no_route, provider, attempts=args.feed_retries, delay=args.retry_delay
+    )
 
     kiosk_link = f"{KIOSK_BASE}?route={args.route}&bus="
+    ts = myt_timestamp()
+    now = time.time()
 
     if raw_matching_count is None:
-        print("[error] no data received from feed within timeout", file=sys.stderr)
+        print(f"[error] no data received from feed after {args.feed_retries} attempts",
+              file=sys.stderr)
         if prev_state != "error":
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
                 f"⚠️ Route {args.route}: couldn't reach the bus feed at all "
-                f"(might be down, or script needs a config tweak).\n{kiosk_link}"
+                f"after {args.feed_retries} tries (might be down, or script "
+                f"needs a config tweak).\nAs of {ts}\n{kiosk_link}"
             )
-        save_state(args.state_file, "error", None)
+            last_alert_at = now
+        save_state(args.state_file, "error", None, last_alert_at)
         sys.exit(1)
 
     print(f"[info] buses reporting route {args.route}: {raw_matching_count}")
@@ -342,17 +390,36 @@ def main():
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
                 f"🚌 Route {args.route}: dropped to {count} bus(es) currently "
-                f"active (normal is 2). Check before heading out.\n{kiosk_link}"
+                f"active (normal is 2). Check before heading out.\n"
+                f"As of {ts}\n{kiosk_link}"
             )
         else:
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
-                f"✅ Route {args.route}: back to normal ({count} buses active).\n{kiosk_link}"
+                f"✅ Route {args.route}: back to normal ({count} buses active).\n"
+                f"As of {ts}\n{kiosk_link}"
             )
+        last_alert_at = now
+    elif new_state == "low":
+        # Same state as last time, but if it's still "low" and enough time
+        # has passed, send a reminder rather than staying silent for the
+        # whole disruption.
+        minutes_since_alert = (now - last_alert_at) / 60
+        if minutes_since_alert >= args.reminder_minutes:
+            send_telegram(
+                args.telegram_token, args.telegram_chat_id,
+                f"🚌 Still only {count} bus(es) active on route {args.route}.\n"
+                f"As of {ts}\n{kiosk_link}"
+            )
+            last_alert_at = now
+        else:
+            print(f"[info] still low, but only {minutes_since_alert:.1f} min "
+                  f"since last alert (threshold {args.reminder_minutes}), "
+                  f"staying quiet", file=sys.stderr)
     else:
         print(f"[info] state unchanged ({new_state}), no alert sent")
 
-    save_state(args.state_file, new_state, count)
+    save_state(args.state_file, new_state, count, last_alert_at)
 
 
 if __name__ == "__main__":
