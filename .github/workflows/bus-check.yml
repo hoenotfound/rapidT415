@@ -17,11 +17,11 @@ name: Bus Route Monitor
 
 on:
   schedule:
-    # Weekday mornings, MYT ~7:00-9:00 (UTC 23:00-01:00, so split across two lines)
-    - cron: "*/10 23 * * 0-4"   # Mon-Fri MYT mornings (Sun-Thu UTC due to date rollover)
-    - cron: "*/10 0-1 * * 1-5"  # continuation into MYT ~08:00-09:00
-    # Weekday evenings, MYT ~17:00-19:00 (UTC 09:00-11:00)
-    - cron: "*/10 9-11 * * 1-5"
+    # Weekday mornings, MYT 6:00-8:00 (UTC 22:00-23:59 the previous day,
+    # so in UTC terms this is Sun-Thu, since MYT is 8 hours ahead)
+    - cron: "*/10 22-23 * * 0-4"
+    # Weekday evenings, MYT 16:00-19:00 (UTC 08:00-10:59, same calendar day)
+    - cron: "*/10 8-10 * * 1-5"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab to test
 
 jobs:
