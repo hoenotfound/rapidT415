@@ -13,6 +13,14 @@ bus's position against the route's own bus stops (also embedded in the
 kiosk page) and requiring it to be within --max-distance-km of at least
 one stop.
 
+Optionally (via --watch-stop-id / --watch-stop-name) it can also watch a
+SPECIFIC stop and alert once a bus that was near it is no longer near it,
+within a configurable time window around a scheduled departure (e.g. a
+7:00am and 7:30am departure from your usual stop). Detection resolution
+is limited by how often this script runs (every 10 min in the default
+GitHub Actions schedule), so a "departed" alert can arrive up to ~10 min
+after it actually happened.
+
 HOW IT WORKS
 ------------
 1. GET the kiosk page (e.g. https://myrapidbus.prasarana.com.my/kiosk?route=765&bus=)
@@ -173,7 +181,113 @@ def filter_on_route(buses, stops, max_distance_km):
     return on_route
 
 
-def try_parse_payload(data):
+def find_stop(stops, stop_id=None, name_contains=None):
+    """Find a specific stop by id (preferred) or by name substring."""
+    if stop_id:
+        for s in stops:
+            if str(s.get("stop_id", "")).upper() == stop_id.upper():
+                return s
+    if name_contains:
+        for s in stops:
+            if name_contains.upper() in str(s.get("stop_name", "")).upper():
+                return s
+    return None
+
+
+def nearest_bus_distance_km(buses, target_lat, target_lon):
+    """Closest distance from any bus in the list to a single point.
+    Returns None if there are no buses with usable coordinates."""
+    dists = []
+    for b in buses:
+        try:
+            blat, blon = float(b.get("latitude")), float(b.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        dists.append(haversine_km(blat, blon, target_lat, target_lon))
+    return min(dists) if dists else None
+
+
+def parse_departure_windows(departures_str, before_minutes=10, after_minutes=15):
+    """Turn '07:00,07:30' into a list of (label, start_minutes_of_day,
+    end_minutes_of_day) windows, e.g. 07:00 -> (06:50, 07:15)."""
+    windows = []
+    for part in departures_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        h, m = map(int, part.split(":"))
+        center = h * 60 + m
+        windows.append((part, center - before_minutes, center + after_minutes))
+    return windows
+
+
+def current_myt_minutes_and_date():
+    from datetime import datetime, timezone, timedelta
+    myt = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc).astimezone(myt)
+    return now.hour * 60 + now.minute, now.strftime("%Y-%m-%d")
+
+
+def check_stop_departure(on_route_buses, stops, args, stop_watch_state, ts, kiosk_link,
+                          telegram_token, telegram_chat_id):
+    """Detect a bus departing a specific stop (e.g. the one you catch it
+    from), inside configured time windows around scheduled departures.
+    Mutates and returns the updated stop_watch_state dict."""
+    if not args.watch_stop_id and not args.watch_stop_name:
+        return stop_watch_state  # feature not enabled
+
+    target = find_stop(stops, args.watch_stop_id, args.watch_stop_name)
+    if target is None:
+        print(f"[warn] watched stop '{args.watch_stop_id or args.watch_stop_name}' "
+              f"not found in this route's stop list -- skipping departure watch. "
+              f"Known stop_ids: {[s.get('stop_id') for s in stops]}", file=sys.stderr)
+        return stop_watch_state
+
+    coords = stop_lat_lon(target)
+    if coords is None:
+        print(f"[warn] watched stop found but has no usable coordinates: {target}",
+              file=sys.stderr)
+        return stop_watch_state
+
+    target_lat, target_lon = coords
+    now_minutes, today = current_myt_minutes_and_date()
+
+    if stop_watch_state.get("date") != today:
+        stop_watch_state = {"date": today, "windows": {}}
+
+    windows = parse_departure_windows(args.watch_departures)
+    active_window = next(
+        (label for label, start, end in windows if start <= now_minutes <= end), None
+    )
+    if active_window is None:
+        print("[debug] stop-watch: outside any departure window right now, skipping",
+              file=sys.stderr)
+        return stop_watch_state
+
+    w_state = stop_watch_state["windows"].setdefault(
+        active_window, {"seen_near": False, "alerted": False}
+    )
+    if w_state["alerted"]:
+        return stop_watch_state  # already alerted for this window today
+
+    distance = nearest_bus_distance_km(on_route_buses, target_lat, target_lon)
+    print(f"[debug] stop-watch [{active_window}]: nearest bus to "
+          f"{target.get('stop_name', args.watch_stop_id)} is "
+          f"{'n/a' if distance is None else f'{distance:.2f} km'} away "
+          f"(seen_near so far: {w_state['seen_near']})", file=sys.stderr)
+
+    if distance is not None and distance <= args.watch_near_km:
+        w_state["seen_near"] = True
+    elif w_state["seen_near"]:
+        # was near, now isn't -> treat as departed
+        send_telegram(
+            telegram_token, telegram_chat_id,
+            f"🚏 A route {args.route} bus has left {target.get('stop_name', args.watch_stop_id)}"
+            f" (~{active_window} departure).\nAs of {ts}\n{kiosk_link}"
+        )
+        w_state["alerted"] = True
+
+    return stop_watch_state
     """Try a few plausible encodings for the live-bus payload, since we
     can't verify live which one the server actually uses."""
     if isinstance(data, list):
@@ -310,13 +424,14 @@ def load_state(path):
         return {"state": "unknown", "count": None, "last_alert_at": 0}
 
 
-def save_state(path, state, count, last_alert_at):
+def save_state(path, state, count, last_alert_at, stop_watch):
     with open(path, "w") as f:
         json.dump({
             "state": state,
             "count": count,
             "checked_at": time.time(),
             "last_alert_at": last_alert_at,
+            "stop_watch": stop_watch,
         }, f)
 
 
@@ -343,11 +458,26 @@ def main():
                          help="While still in a 'low' state, re-send a "
                               "reminder at most this often, in minutes "
                               "(default 25).")
+    parser.add_argument("--watch-stop-id", default="",
+                         help="Stop ID to watch for departures, e.g. 'KJ153'. "
+                              "Leave blank to disable this feature.")
+    parser.add_argument("--watch-stop-name", default="",
+                         help="Fallback: match a stop by name substring "
+                              "instead of/as well as --watch-stop-id, "
+                              "e.g. 'MAHKOTA RESIDENCE'.")
+    parser.add_argument("--watch-departures", default="07:00,07:30",
+                         help="Comma-separated HH:MM (MYT) scheduled "
+                              "departure times to watch for at the given "
+                              "stop (default '07:00,07:30').")
+    parser.add_argument("--watch-near-km", type=float, default=0.3,
+                         help="A bus within this distance of the watched "
+                              "stop counts as 'at' it (default 0.3 km).")
     args = parser.parse_args()
 
     previous = load_state(args.state_file)
     prev_state = previous.get("state", "unknown")
     last_alert_at = previous.get("last_alert_at", 0)
+    stop_watch = previous.get("stop_watch", {"date": "", "windows": {}})
 
     no_route, provider, stops = get_route_metadata(args.route)
     print(f"[info] route param={args.route} -> no_route={no_route} provider={provider!r}")
@@ -371,7 +501,7 @@ def main():
                 f"needs a config tweak).\nAs of {ts}\n{kiosk_link}"
             )
             last_alert_at = now
-        save_state(args.state_file, "error", None, last_alert_at)
+        save_state(args.state_file, "error", None, last_alert_at, stop_watch)
         sys.exit(1)
 
     print(f"[info] buses reporting route {args.route}: {raw_matching_count}")
@@ -419,7 +549,12 @@ def main():
     else:
         print(f"[info] state unchanged ({new_state}), no alert sent")
 
-    save_state(args.state_file, new_state, count, last_alert_at)
+    stop_watch = check_stop_departure(
+        on_route, stops, args, stop_watch, ts, kiosk_link,
+        args.telegram_token, args.telegram_chat_id
+    )
+
+    save_state(args.state_file, new_state, count, last_alert_at, stop_watch)
 
 
 if __name__ == "__main__":
