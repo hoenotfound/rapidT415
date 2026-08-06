@@ -24,6 +24,9 @@ on:
     - cron: "*/10 8-10 * * 1-5"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab to test
 
+permissions:
+  contents: write   # needed so the workflow can commit status.json back
+
 jobs:
   check-bus:
     runs-on: ubuntu-latest
@@ -40,3 +43,19 @@ jobs:
             --route 765 \
             --telegram-token "${{ secrets.TELEGRAM_TOKEN }}" \
             --telegram-chat-id "${{ secrets.TELEGRAM_CHAT_ID }}"
+      - name: Save state
+        if: always()   # commit status.json even if the check step above exited 1 (e.g. feed error)
+        run: |
+          if [ -f status.json ]; then
+            git config user.name "bus-monitor-bot"
+            git config user.email "actions@github.com"
+            git add status.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update bus status [skip ci]"
+              git push
+            else
+              echo "No change in status.json, nothing to commit."
+            fi
+          else
+            echo "status.json was not created, skipping commit."
+          fi
