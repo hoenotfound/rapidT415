@@ -313,13 +313,15 @@ def main():
 
     raw_matching_count, raw_matching = count_active_buses(no_route, provider)
 
+    kiosk_link = f"{KIOSK_BASE}?route={args.route}&bus="
+
     if raw_matching_count is None:
         print("[error] no data received from feed within timeout", file=sys.stderr)
         if prev_state != "error":
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
                 f"⚠️ Route {args.route}: couldn't reach the bus feed at all "
-                f"(might be down, or script needs a config tweak)."
+                f"(might be down, or script needs a config tweak).\n{kiosk_link}"
             )
         save_state(args.state_file, "error", None)
         sys.exit(1)
@@ -340,12 +342,12 @@ def main():
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
                 f"🚌 Route {args.route}: dropped to {count} bus(es) currently "
-                f"active (normal is 2). Check before heading out."
+                f"active (normal is 2). Check before heading out.\n{kiosk_link}"
             )
         else:
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
-                f"✅ Route {args.route}: back to normal ({count} buses active)."
+                f"✅ Route {args.route}: back to normal ({count} buses active).\n{kiosk_link}"
             )
     else:
         print(f"[info] state unchanged ({new_state}), no alert sent")
