@@ -533,7 +533,7 @@ def main():
         else:
             send_telegram(
                 args.telegram_token, args.telegram_chat_id,
-                f"✅ Route {args.route}: back to normal ({count} buses active).\n"
+                f"✅ Route T415: back to normal ({count} buses active).\n"
                 f"As of {ts}\n{kiosk_link}"
             )
         last_alert_at = now
