@@ -181,7 +181,10 @@ def count_active_buses(no_route, provider, timeout=15):
                 print(f"[debug]   distinct 'route' values seen: {distinct_routes[:30]}"
                       f"{' ...' if len(distinct_routes) > 30 else ''}", file=sys.stderr)
 
-        matching = [b for b in buses if str(b.get("route", "")) == str(no_route)]
+        matching = [
+            b for b in buses
+            if str(b.get("route", "")).startswith(str(no_route))
+        ]
         result["count"] = len(matching)
         result["raw"] = buses
 
