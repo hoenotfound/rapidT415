@@ -59,7 +59,7 @@ import string
 
 import requests
 from bs4 import BeautifulSoup
-from socketIO_client_2 import SocketIO, BaseNamespace
+from socketIO_client import SocketIO, BaseNamespace
 
 KIOSK_BASE = "https://myrapidbus.prasarana.com.my/kiosk"
 SOCKET_HOST = "rapidbus-socketio-avl.prasarana.com.my"
