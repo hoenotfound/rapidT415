@@ -149,6 +149,20 @@ def send_telegram(token, chat_id, message):
     resp.raise_for_status()
 
 
+def load_state(path):
+    """Read the last known state from disk. Missing/corrupt file = unknown."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "unknown", "count": None}
+
+
+def save_state(path, state, count):
+    with open(path, "w") as f:
+        json.dump({"state": state, "count": count, "checked_at": time.time()}, f)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--route", default="765", help="Route number, as in the kiosk URL")
@@ -156,7 +170,13 @@ def main():
     parser.add_argument("--telegram-chat-id", required=True)
     parser.add_argument("--alert-threshold", type=int, default=1,
                          help="Send alert if bus count <= this (default 1)")
+    parser.add_argument("--state-file", default="status.json",
+                         help="Where to persist last known state, so alerts "
+                              "only fire on a CHANGE, not every check.")
     args = parser.parse_args()
+
+    previous = load_state(args.state_file)
+    prev_state = previous.get("state", "unknown")
 
     no_route, provider = get_route_metadata(args.route)
     print(f"[info] route param={args.route} -> no_route={no_route} provider={provider!r}")
@@ -165,23 +185,36 @@ def main():
 
     if count is None:
         print("[error] no data received from feed within timeout", file=sys.stderr)
-        send_telegram(
-            args.telegram_token, args.telegram_chat_id,
-            f"⚠️ Route {args.route}: couldn't reach the bus feed at all "
-            f"(might be down, or script needs a config tweak)."
-        )
+        if prev_state != "error":
+            send_telegram(
+                args.telegram_token, args.telegram_chat_id,
+                f"⚠️ Route {args.route}: couldn't reach the bus feed at all "
+                f"(might be down, or script needs a config tweak)."
+            )
+        save_state(args.state_file, "error", None)
         sys.exit(1)
 
     print(f"[info] active buses on route {args.route}: {count}")
+    new_state = "low" if count <= args.alert_threshold else "normal"
 
-    if count <= args.alert_threshold:
-        send_telegram(
-            args.telegram_token, args.telegram_chat_id,
-            f"🚌 Route {args.route}: only {count} bus(es) currently active "
-            f"(normal is 2). Check before heading out."
-        )
+    if new_state != prev_state:
+        # Only message on an actual transition (normal->low, low->normal,
+        # error->either). Repeated checks that find the same state stay quiet.
+        if new_state == "low":
+            send_telegram(
+                args.telegram_token, args.telegram_chat_id,
+                f"🚌 Route {args.route}: dropped to {count} bus(es) currently "
+                f"active (normal is 2). Check before heading out."
+            )
+        else:
+            send_telegram(
+                args.telegram_token, args.telegram_chat_id,
+                f"✅ Route {args.route}: back to normal ({count} buses active)."
+            )
     else:
-        print("[info] normal operation, no alert sent")
+        print(f"[info] state unchanged ({new_state}), no alert sent")
+
+    save_state(args.state_file, new_state, count)
 
 
 if __name__ == "__main__":
