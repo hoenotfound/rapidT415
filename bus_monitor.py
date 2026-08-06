@@ -172,6 +172,14 @@ def count_active_buses(no_route, provider, timeout=15):
             print("[error] could not decode payload from any argument received "
                   "-- see [debug] lines above for the raw shape", file=sys.stderr)
             buses = []
+        else:
+            print(f"[debug] decoded payload OK, {len(buses)} record(s) total",
+                  file=sys.stderr)
+            if buses:
+                print(f"[debug]   sample record: {buses[0]}", file=sys.stderr)
+                distinct_routes = sorted(set(str(b.get("route", "")) for b in buses))
+                print(f"[debug]   distinct 'route' values seen: {distinct_routes[:30]}"
+                      f"{' ...' if len(distinct_routes) > 30 else ''}", file=sys.stderr)
 
         matching = [b for b in buses if str(b.get("route", "")) == str(no_route)]
         result["count"] = len(matching)
