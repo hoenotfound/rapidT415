@@ -1,0 +1,5 @@
+requests
+beautifulsoup4
+socketIO-client-2
+flask
+gunicorn
